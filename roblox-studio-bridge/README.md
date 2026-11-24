@@ -58,8 +58,15 @@ Pick **one**:
 - **No git:** on GitHub press **Code → Download ZIP**, unzip, open
   `roblox-studio-bridge`.
 
+> The two double-clickable files (`SETUP.bat`, `START_BRIDGE.bat`) are at the **top level**
+> of the repo *and* inside `roblox-studio-bridge`. Either copy works — the top-level ones
+> just forward into the folder.
+
 > Keep the folder somewhere permanent like `C:\RobloxBridge`. Do **not** run it from inside
 > the ZIP preview or the Downloads temp folder.
+
+> **Windows hides file extensions by default**, so `SETUP.bat` may just look like
+> `SETUP` with a small gear icon. That is the file you want.
 
 ### Step 2 — Turn on Roblox's MCP server (inside Studio)
 
@@ -209,9 +216,9 @@ git pull
 
 | File | Runs on | Purpose |
 |---|---|---|
+| `SETUP.bat` | Your PC | **Start here.** One-time token + health check |
+| `START_BRIDGE.bat` | Your PC | **Double-click every session** to start the bridge |
 | `bridge.py` | Your PC | Starts Roblox's MCP server, relays requests |
-| `START_BRIDGE.bat` | Your PC | Double-click to start the bridge |
-| `SETUP.bat` | Your PC | One-time token + health check |
 | `relay.py` | Sandbox | Long-poll relay the bridge connects to |
 | `client.py` | Sandbox | The agent's command-line client |
 | `selftest.py` | Either | Offline end-to-end test (no Roblox needed) |
