@@ -1,0 +1,7 @@
+# runtime secrets / caches
+bridge.config.json
+relay.json
+relay.token
+.cache/
+__pycache__/
+*.pyc
