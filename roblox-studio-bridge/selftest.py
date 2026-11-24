@@ -51,7 +51,7 @@ def main():
         for _ in range(80):
             time.sleep(0.25)
             boot += (bridge.stdout.readline() or "")
-            p = os.path.join(tmp, "status.json")
+            p = os.path.join(tmp, "_queue", "status.json")
             if os.path.exists(p):
                 try:
                     if json.load(open(p))["state"] == "ready":

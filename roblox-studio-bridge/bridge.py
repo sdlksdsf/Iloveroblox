@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 Roblox Studio MCP Bridge  -  runs on YOUR PC, next to Roblox Studio.
 =====================================================================
 
 WHAT IT DOES (plain English)
   1. Starts Roblox's OWN MCP server, exactly the way Roblox's documentation does:
 
-         cmd.exe /c cd /d %LOCALAPPDATA%\Roblox && .\\mcp.bat
+         cmd.exe /c cd /d %LOCALAPPDATA%\Roblox && .\mcp.bat
 
-  2. Looks up where the AI sandbox currently is (a small public "beacon" file).
-  3. Long-polls that sandbox for work.
-  4. Runs each request against your open Roblox Studio session and sends the
-     result back.
+  2. Watches a PRIVATE GitHub repo that you own for requests.
+  3. Runs each request against your open Roblox Studio session.
+  4. Writes the result back to that same private repo.
+
+Why a GitHub repo? Because it is the one place both your PC and the AI sandbox
+can reach without any tunnel, port forwarding, firewall change or browser
+token. It also keeps working while the sandbox is asleep, so the bridge never
+shows a scary error when the agent is idle.
 
 WHAT IT DOES NOT DO
   - It does not download or run any other program.
   - It does not install anything, edit the registry, or need admin rights.
   - It does not open a listening port on your PC, so your firewall stays shut.
-  - It only ever makes OUTBOUND requests to two places:
-        api.github.com   (reads one tiny public JSON file)
-        the sandbox relay (your game data, over HTTPS, bearer-token protected)
+  - It only ever makes OUTBOUND HTTPS requests to api.github.com.
   - It never reads files outside its own folder, except Roblox's own mcp.bat.
 
-One file, ~450 lines, no third-party packages. Read it before you run it.
+One file, no third-party packages. Read it before you run it.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import os
 import secrets
@@ -40,12 +43,18 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 USER_AGENT = "roblox-studio-bridge/" + VERSION
+API_VERSION = "2022-11-28"
 MCP_PROTOCOL = "2024-11-05"
 CLIENT_INFO = {"name": "arena-roblox-bridge", "version": VERSION}
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "bridge.config.json")
+LOG_FILE = os.path.join(HERE, "bridge.log")
+
+TO_STUDIO = "_queue/to-studio"
+TO_SANDBOX = "_queue/to-sandbox"
+STATUS = "_queue/status.json"
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -53,9 +62,6 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-
-
-LOG_FILE = os.path.join(HERE, "bridge.log")
 
 
 def log(msg):
@@ -91,107 +97,247 @@ class DirTransport:
             p = os.path.join(p, name)
         return p
 
-    def pull(self):
-        d = self._path("to-studio")
+    def list(self, rel):
+        d = self._path(rel)
         os.makedirs(d, exist_ok=True)
         out = []
         for n in sorted(os.listdir(d)):
             if n.startswith(".") or not n.endswith(".json"):
                 continue
-            with open(self._path("to-studio", n), "r", encoding="utf-8") as fh:
-                req = json.load(fh)
-            req["_name"] = n
-            out.append(req)
+            out.append({"name": n, "sha": "0" * 7})
         return out
 
-    def reply(self, rid, payload):
-        d = self._path("to-sandbox")
-        os.makedirs(d, exist_ok=True)
-        with open(self._path("to-sandbox", rid + ".json"), "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
+    def read(self, rel, name):
+        with open(self._path(rel, name), "r", encoding="utf-8") as fh:
+            return json.load(fh)
 
-    def ack(self, rid, name=None):
+    def write(self, rel, name, obj):
+        os.makedirs(self._path(rel), exist_ok=True)
+        tmp = self._path(rel, "." + name + ".tmp")
+        final = self._path(rel, name)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False)
+        os.replace(tmp, final)
+
+    def read_optional(self, rel, name):
         try:
-            os.remove(self._path("to-studio", name or (rid + ".json")))
+            return self.read(rel, name)
+        except FileNotFoundError:
+            return None
+
+    def delete(self, rel, name, sha=None):
+        try:
+            os.remove(self._path(rel, name))
         except FileNotFoundError:
             pass
-
-    def beat(self, state, extra=None):
-        payload = {"state": state, "ts": now()}
-        if extra:
-            payload.update(extra)
-        d = self._path(".")
-        os.makedirs(d, exist_ok=True)
-        with open(self._path(".", "status.json"), "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
 
     def close(self):
         pass
 
 
 # --------------------------------------------------------------------------
-# Transport B: the sandbox relay, over HTTPS.
+# Transport B: your private GitHub repo, through the REST API.
+#
+# One message = one small JSON file. The producer writes it, the consumer
+# deletes it after it has safely stored the reply. Every message has a unique
+# id, so a retry can never run the same Studio command twice.
 # --------------------------------------------------------------------------
-class HttpTransport:
-    kind = "http"
+class GitHubTransport:
+    kind = "github"
 
-    def __init__(self, base_url, token, timeout=40):
-        self.base = base_url.rstrip("/")
+    def __init__(self, owner, repo, token, branch="main", api="https://api.github.com"):
+        self.owner = owner
+        self.repo = repo
         self.token = token
-        self.timeout = timeout
+        self.branch = branch or "main"
+        self.api = api.rstrip("/")
+        self._etags = {}
+        self._cache = {}
+        self._lock = threading.Lock()
 
-    def _req(self, method, path, body=None, timeout=None):
+    # ---- low level -------------------------------------------------------
+    def _request(self, method, path, body=None, etag_key=None, ok_codes=(200, 201, 204)):
+        url = self.api + path
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(self.base + path, data=data, method=method)
+        req = urllib.request.Request(url, data=data, method=method)
         req.add_header("User-Agent", USER_AGENT)
-        req.add_header("Accept", "application/json")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", API_VERSION)
+        req.add_header("Authorization", "Bearer " + self.token)
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + self.token)
+        key = etag_key or (method + " " + path)
+        etag = self._etags.get(key)
+        if etag and method == "GET":
+            req.add_header("If-None-Match", etag)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=45) as resp:
                 raw = resp.read()
-                return json.loads(raw) if raw else {}
+                new_etag = resp.headers.get("ETag")
+                if new_etag:
+                    self._etags[key] = new_etag
+                return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")[:300]
+            if exc.code == 304:
+                return 304, None
+            raw = exc.read()
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {"message": raw.decode("utf-8", "replace")}
+            message = payload.get("message", "")
             if exc.code == 401:
                 raise BridgeError(
-                    "The sandbox rejected this PC's token. Run: python bridge.py --setup"
-                )
-            raise BridgeError("relay said %s for %s: %s" % (exc.code, path, raw))
+                    "GitHub rejected the token (401). Re-run SETUP.bat and paste a "
+                    "fresh token.") from exc
+            if exc.code == 403 and "rate limit" in message.lower():
+                raise BridgeError(
+                    "GitHub rate limit hit. Wait a minute and the bridge resumes "
+                    "automatically.") from exc
+            if exc.code == 404:
+                return 404, payload
+            if exc.code in ok_codes:
+                return exc.code, payload
+            raise BridgeError("GitHub said %s for %s %s: %s"
+                              % (exc.code, method, path, message)) from exc
         except urllib.error.URLError as exc:
-            raise BridgeError("cannot reach the sandbox relay (%s)" % exc.reason)
+            raise BridgeError(
+                "Could not reach api.github.com (%s). Check your internet "
+                "connection, VPN or firewall." % exc.reason) from exc
         except TimeoutError:
-            raise BridgeError("the sandbox relay timed out")
+            raise BridgeError("GitHub did not answer in time.")
 
-    def health(self):
-        return self._req("GET", "/health", timeout=10)
+    # ---- transport interface --------------------------------------------
+    def list(self, rel):
+        status, payload = self._request(
+            "GET",
+            "/repos/%s/%s/contents/%s?ref=%s"
+            % (self.owner, self.repo, rel, self.branch),
+            etag_key="list " + rel,
+        )
+        if status == 304:
+            return self._cache.get("list " + rel, [])
+        if status == 404:
+            return []
+        if isinstance(payload, dict):
+            payload = [payload]
+        out = []
+        for item in payload or []:
+            name = item.get("name", "")
+            if name.startswith(".") or not name.endswith(".json"):
+                continue
+            out.append({"name": name, "sha": item.get("sha", "")})
+        self._cache["list " + rel] = out
+        return out
 
-    def status(self):
-        return self._req("GET", "/status", timeout=10)
+    def read(self, rel, name):
+        key = "read " + rel + "/" + name
+        status, payload = self._request(
+            "GET",
+            "/repos/%s/%s/contents/%s/%s?ref=%s"
+            % (self.owner, self.repo, rel, name, self.branch),
+            etag_key=key,
+        )
+        if status == 304 and key in self._cache:
+            return self._cache[key]
+        if status == 404:
+            raise BridgeError("message %s disappeared before it could be read" % name)
+        content = payload.get("content", "")
+        if payload.get("encoding") == "base64":
+            content = base64.b64decode(content).decode("utf-8")
+        obj = json.loads(content)
+        self._cache[key] = obj
+        return obj
 
-    def pull(self):
-        return self._req("GET", "/next?wait=20", timeout=32).get("requests", [])
-
-    def reply(self, rid, payload):
-        body = dict(payload)
-        body["id"] = rid
-        self._req("POST", "/reply", body)
-
-    def ack(self, rid, name=None):
+    def read_optional(self, rel, name):
+        """Same as read(), but returns None instead of raising when absent."""
         try:
-            self._req("POST", "/ack", {"id": rid}, timeout=10)
-        except BridgeError:
-            pass
+            return self.read(rel, name)
+        except BridgeError as exc:
+            if "disappeared" in str(exc):
+                return None
+            raise
 
-    def beat(self, state, extra=None):
-        body = {"state": state, "ts": now()}
-        if extra:
-            body.update(extra)
-        try:
-            self._req("POST", "/beat", body, timeout=10)
-        except BridgeError:
-            pass
+    def write(self, rel, name, obj):
+        with self._lock:
+            path = "/repos/%s/%s/contents/%s/%s" % (self.owner, self.repo, rel, name)
+            body = {
+                "message": "bridge: " + name,
+                "branch": self.branch,
+                "content": base64.b64encode(
+                    json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                ).decode("ascii"),
+            }
+            status, payload = self._request("PUT", path, body,
+                                           ok_codes=(200, 201, 409, 422))
+            # GitHub wants the file's current sha when it already exists, and
+            # 409 means someone changed it underneath us. Retry with the
+            # fresh sha a couple of times before giving up.
+            for _attempt in range(3):
+                if status in (200, 201):
+                    break
+                st, meta = self._request(
+                    "GET", path + "?ref=" + self.branch, etag_key=None)
+                if st != 200 or not isinstance(meta, dict) or not meta.get("sha"):
+                    break
+                body["sha"] = meta["sha"]
+                status, payload = self._request("PUT", path, body,
+                                                ok_codes=(200, 201, 409, 422))
+            if status not in (200, 201):
+                detail = payload.get("message") if isinstance(payload, dict) else payload
+                raise BridgeError("could not write %s/%s: %s" % (rel, name, detail))
+            self._etags.pop("list " + rel, None)
+            self._etags.pop("read " + rel + "/" + name, None)
+            self._cache.pop("list " + rel, None)
+            self._cache.pop("read " + rel + "/" + name, None)
+
+    def delete(self, rel, name, sha=None):
+        if not sha:
+            st, meta = self._request(
+                "GET",
+                "/repos/%s/%s/contents/%s/%s?ref=%s"
+                % (self.owner, self.repo, rel, name, self.branch),
+                etag_key=None,
+            )
+            if st != 200 or not isinstance(meta, dict):
+                return
+            sha = meta.get("sha")
+        body = {"message": "bridge: ack " + name, "sha": sha, "branch": self.branch}
+        st, _ = self._request(
+            "DELETE",
+            "/repos/%s/%s/contents/%s/%s" % (self.owner, self.repo, rel, name),
+            body,
+            ok_codes=(200, 204),
+        )
+        if st == 404:
+            return
+        self._etags.pop("list " + rel, None)
+        self._etags.pop("read " + rel + "/" + name, None)
+        self._cache.pop("list " + rel, None)
+        self._cache.pop("read " + rel + "/" + name, None)
+
+    def probe(self):
+        """Return repo metadata, or raise a clear error."""
+        st, meta = self._request(
+            "GET", "/repos/%s/%s" % (self.owner, self.repo), etag_key=None)
+        if st != 200 or not isinstance(meta, dict):
+            raise BridgeError("could not read repository %s/%s" % (self.owner, self.repo))
+        return meta
+
+    def roundtrip(self):
+        """Write, list, read and delete a scratch file. Proves read+write."""
+        name = "probe-%s.json" % secrets.token_hex(4)
+        payload = {"ok": True, "ts": now(), "note": "write test"}
+        self.write("_queue", name, payload)
+        names = [i["name"] for i in self.list("_queue")]
+        if name not in names:
+            raise BridgeError("wrote a test file but could not list it - the token "
+                              "may be read-only")
+        back = self.read("_queue", name)
+        self.delete("_queue", name)
+        if back.get("ok") is not True:
+            raise BridgeError("test file came back corrupted")
+        return True
 
     def close(self):
         pass
@@ -233,8 +379,7 @@ class McpProcess:
         if self.proc.poll() is not None:
             raise BridgeError(
                 "Roblox's MCP server exited immediately (code %s). %s"
-                % (self.proc.returncode, self.tail() or "It printed no error.")
-            )
+                % (self.proc.returncode, self.tail() or "It printed no error."))
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -261,7 +406,7 @@ class McpProcess:
                 try:
                     msg = json.loads(line)
                 except Exception:
-                    self._log.append("stdout: " + line[:300])  # a banner, not JSON-RPC
+                    self._log.append("stdout: " + line[:300])
                     del self._log[:-30]
                     continue
                 mid = msg.get("id")
@@ -346,17 +491,16 @@ class McpProcess:
 
 
 # --------------------------------------------------------------------------
-# Config + beacon
+# Config
 # --------------------------------------------------------------------------
 def load_config(path=CONFIG_PATH):
     if not os.path.exists(path):
-        raise BridgeError(
-            "No config yet. Run this first:\n\n    python bridge.py --setup\n"
-        )
+        raise BridgeError("No config yet. Run this first:\n\n    python bridge.py --setup\n")
     with open(path, "r", encoding="utf-8") as fh:
         cfg = json.load(fh)
-    if not cfg.get("token"):
-        raise BridgeError("Config has no token. Run: python bridge.py --setup")
+    for key in ("owner", "repo", "token"):
+        if not cfg.get(key):
+            raise BridgeError("Config is missing '%s'. Run: python bridge.py --setup" % key)
     return cfg
 
 
@@ -371,24 +515,12 @@ def save_config(cfg, path=CONFIG_PATH):
         pass
 
 
-def fetch_beacon(url, timeout=20):
-    """Read the tiny public file that says where the sandbox is right now."""
-    req = urllib.request.Request(url)
-    req.add_header("User-Agent", USER_AGENT)
-    req.add_header("Accept", "application/vnd.github+json")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise BridgeError("beacon returned HTTP %s" % exc.code)
-    except Exception as exc:
-        raise BridgeError("cannot read the beacon: %r" % exc)
-    # If the beacon is served through the GitHub contents API, it is base64.
-    if isinstance(data, dict) and data.get("content") and data.get("encoding") == "base64":
-        data = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
-    if not isinstance(data, dict) or not data.get("relay"):
-        raise BridgeError("beacon has no 'relay' field yet - is the sandbox online?")
-    return data
+def build_transport(cfg, args):
+    if args.transport:
+        if args.transport.startswith("dir:"):
+            return DirTransport(args.transport[4:])
+        raise BridgeError("Only dir:<folder> is supported for --transport.")
+    return GitHubTransport(cfg["owner"], cfg["repo"], cfg["token"], cfg.get("branch", "main"))
 
 
 def default_mcp_cmd():
@@ -404,18 +536,7 @@ def default_mcp_cmd():
             "Roblox's MCP launcher was not found at:\n    %s\n\n"
             "Update Roblox Studio, open it once, then retry. If Studio lives "
             "somewhere unusual, pass --mcp-bat." % bat)
-    return ["cmd.exe", "/c", "cd /d %LOCALAPPDATA%\\Roblox && .\\mcp.bat"]
-
-
-def build_transport(cfg, args):
-    if args.transport:
-        if args.transport.startswith("dir:"):
-            return DirTransport(args.transport[4:])
-        raise BridgeError("Only dir:<folder> is supported for --transport.")
-    url = getattr(args, "relay_url", None) or cfg.get("relay_url")
-    if not url:
-        raise BridgeError("No relay URL. Run: python bridge.py --setup")
-    return HttpTransport(url, cfg["token"])
+    return ["cmd.exe", "/c", r"cd /d %LOCALAPPDATA%\Roblox && .\mcp.bat"]
 
 
 # --------------------------------------------------------------------------
@@ -441,6 +562,16 @@ def handle_request(mcp, req):
     return {"ok": True, "result": reply.get("result")}
 
 
+def write_status(tr, state, extra=None):
+    payload = {"state": state, "ts": now(), "pid": os.getpid(), "version": VERSION}
+    if extra:
+        payload.update(extra)
+    try:
+        tr.write("_queue", "status.json", payload)
+    except Exception as exc:
+        log("could not write status.json: %s" % exc)
+
+
 # --------------------------------------------------------------------------
 def cmd_setup(args):
     print("\n=== Roblox Studio MCP Bridge - one-time setup ===\n")
@@ -451,18 +582,39 @@ def cmd_setup(args):
         except Exception:
             cfg = {}
 
-    cfg["token"] = cfg.get("token") or "rlx_" + secrets.token_urlsafe(32)
-    cfg["beacon_url"] = args.beacon or cfg.get("beacon_url") or DEFAULT_BEACON
-    save_config(cfg, args.config)
+    owner = input("GitHub username: ").strip() or cfg.get("owner", "")
+    if not owner:
+        raise BridgeError("A username is required.")
+    repo = input("Private relay repo name [roblox-studio-bridge]: ").strip() or "roblox-studio-bridge"
+    branch = input("Branch [main]: ").strip() or "main"
 
-    print("This PC's secret token (already saved to bridge.config.json):\n")
-    print("    " + cfg["token"] + "\n")
-    print("Paste that one line to your Arena agent, once. It lets the sandbox")
-    print("talk to this PC and nothing else. You can revoke it any time by")
-    print("deleting bridge.config.json and running --setup again.\n")
-    print("Saved to: %s" % args.config)
-    print("Beacon  : %s\n" % cfg["beacon_url"])
-    print("Next:    python bridge.py --doctor\n")
+    print("\nThe token must be a FINE-GRAINED personal access token:\n"
+          "  Repository access : Only select repositories -> %s\n"
+          "  Permissions       : Contents = Read and write    (nothing else)\n"
+          "Create it here: https://github.com/settings/personal-access-tokens/new\n" % repo)
+    token = getpass.getpass("Paste the token (typing is hidden): ").strip()
+    if not token:
+        raise BridgeError("A token is required.")
+
+    cfg.update({"owner": owner, "repo": repo, "branch": branch, "token": token})
+    print("\nChecking GitHub access...")
+    tr = GitHubTransport(owner, repo, token, branch)
+    meta = tr.probe()
+    if meta.get("private") is False:
+        print("  WARNING: %s/%s is PUBLIC. Your game code will be readable by anyone."
+              % (owner, repo))
+        if input("  Type 'yes' to continue anyway: ").strip().lower() != "yes":
+            raise BridgeError("Cancelled - make the repo private and run --setup again.")
+    print("  OK - token works, repo is %s" % ("private" if meta.get("private") else "public"))
+
+    tr.roundtrip()
+    print("  OK - read/write verified with a scratch file")
+
+    save_config(cfg, args.config)
+    print("\nSaved to: %s\n" % args.config)
+    print("Now paste this token to your Arena agent, once:\n")
+    print("    " + token + "\n")
+    print("Next:  python bridge.py --doctor\n")
     return 0
 
 
@@ -479,12 +631,29 @@ def cmd_doctor(args):
 
     try:
         cfg = load_config(args.config)
-        print("Token       : %s..." % cfg["token"][:10])
+        print("Config      : %s/%s (branch %s)" % (cfg["owner"], cfg["repo"],
+                                                   cfg.get("branch", "main")))
     except BridgeError as exc:
-        print("Token       : not ready -> %s" % exc)
+        print("Config      : not ready -> %s" % exc)
         return 1
 
-    # ---- local half: Roblox Studio itself (works while the sandbox sleeps)
+    if args.transport:
+        tr = build_transport(cfg, args)
+    else:
+        tr = GitHubTransport(cfg["owner"], cfg["repo"], cfg["token"], cfg.get("branch", "main"))
+
+    if tr.kind == "github":
+        try:
+            meta = tr.probe()
+            print("GitHub      : OK (%s)" % ("private" if meta.get("private") else "PUBLIC"))
+            tr.roundtrip()
+            print("Queue       : read/write verified")
+        except BridgeError as exc:
+            print("GitHub      : FAILED -> %s" % exc)
+            print("\nFix: create a fine-grained token with Contents = Read and write\n"
+                  "on this exact repository, then re-run SETUP.bat.\n")
+            return 1
+
     mcp = McpProcess(cmd)
     names = []
     try:
@@ -506,88 +675,37 @@ def cmd_doctor(args):
     finally:
         mcp.stop()
 
-    # ---- remote half: the sandbox relay --------------------------------
-    if args.transport:
-        tr = build_transport(cfg, args)
-    elif args.relay_url:
-        tr = HttpTransport(args.relay_url, cfg["token"])
-    else:
-        try:
-            beacon = fetch_beacon(cfg.get("beacon_url") or DEFAULT_BEACON)
-            print("Beacon      : %s" % beacon.get("relay"))
-            tr = HttpTransport(beacon["relay"], cfg["token"])
-        except BridgeError as exc:
-            print("Beacon      : unreachable -> %s" % exc)
-            return 1
-
-    print("Relay       : waiting up to 30s for the sandbox ", end="", flush=True)
-    up = False
-    for _ in range(10):
-        try:
-            tr.health()
-            up = True
-            break
-        except BridgeError:
-            print(".", end="", flush=True)
-            time.sleep(3)
-    print()
-
-    if not up:
-        print("Relay       : ASLEEP  (this is normal, not a fault)")
-        print()
-        print("  The sandbox only runs while the agent is working on a message.")
-        print("  To connect:")
-        print("    1. Double-click START_BRIDGE.bat and leave the window open.")
-        print("    2. Send any message in Arena.")
-        print("    3. The bridge connects within seconds and starts working.")
-        print()
-        return 0
-
-    try:
-        tr.status()
-        print("Auth        : OK - the sandbox accepts this PC's token")
-    except BridgeError as exc:
-        print("Auth        : REJECTED -> %s" % exc)
-        print("\nThe sandbox is up but has not been given this PC's token.")
-        print("Paste the full token printed by SETUP.bat into the Arena chat.\n")
-        return 1
-
-    tr.beat("ready", {"tools": len(names)})
+    write_status(tr, "ready", {"tools": len(names)})
     print("\nAll good. Double-click START_BRIDGE.bat to begin.\n")
     return 0
 
 
 def cmd_show_token(args):
     cfg = load_config(args.config)
-    print("\nYour bridge token:\n")
+    print("\nYour GitHub token:\n")
     print("    " + cfg["token"] + "\n")
-    print("Paste that whole line into the Arena chat. It is already saved in")
-    print("bridge.config.json - you do not need to type it again.\n")
+    print("Paste that whole line into the Arena chat, once.\n")
     return 0
 
 
 def cmd_run(args):
-    cmd = args.mcp_cmd or default_mcp_cmd()
-
     if args.transport:
         tr = build_transport({}, args)
         print("Relay: local folder %s" % args.transport[4:])
-    elif args.relay_url:
-        cfg = load_config(args.config)
-        tr = HttpTransport(args.relay_url, cfg["token"])
-        print("Relay: %s" % args.relay_url)
     else:
         cfg = load_config(args.config)
-        cfg.setdefault("beacon_url", args.beacon or DEFAULT_BEACON)
-        tr = HttpTransport("http://127.0.0.1:1/", cfg["token"])  # replaced on first beacon
+        tr = build_transport(cfg, args)
+        print("Relay: %s/%s (branch %s)" % (cfg["owner"], cfg["repo"], cfg.get("branch", "main")))
 
     print("=" * 64)
     print(" Roblox Studio MCP Bridge %s" % VERSION)
     print(" Keep this window open. Ctrl+C stops it.")
     print("=" * 64)
 
-    mcp = McpProcess(cmd)
+    mcp = McpProcess(args.mcp_cmd or default_mcp_cmd())
     answered = set()
+    mcp_ready = False
+    last_heartbeat = 0.0
     last_note = [""]
 
     def say(msg):
@@ -595,88 +713,64 @@ def cmd_run(args):
             log(msg)
             last_note[0] = msg
 
-    mcp_ready = False
-    last_beacon = 0.0
-    last_beat = 0.0
-    relay_ok = bool(args.transport or args.relay_url)  # folder or fixed URL is always "online"
-
     try:
         while True:
-            # ---- keep the MCP server alive --------------------------------
             if mcp.proc is None or mcp.proc.poll() is not None:
                 try:
                     mcp.start()
                     info = mcp.initialize()
                     names = mcp.tool_names()
                     mcp_ready = True
-                    log("Roblox MCP ready: %s (%d tools)" % (
-                        info.get("serverInfo") or "unknown", len(names)))
+                    log("Roblox MCP ready: %s (%d tools)"
+                        % (info.get("serverInfo") or "unknown", len(names)))
+                    write_status(tr, "ready", {"tools": len(names)})
                 except BridgeError as exc:
                     mcp_ready = False
-                    log("Roblox MCP not available: %s" % exc)
-                    log("Check: Studio open, 'Enable Studio as MCP server' ON.")
+                    say("Roblox MCP not available: %s" % exc)
                     time.sleep(5)
                     continue
 
-            # ---- find the sandbox -----------------------------------------
-            if not args.transport and not args.relay_url:
-                if time.time() - last_beacon > 120 or not relay_ok:
-                    last_beacon = time.time()
-                    try:
-                        cfg = load_config(args.config)
-                        beacon = fetch_beacon(cfg.get("beacon_url") or DEFAULT_BEACON)
-                        url = beacon["relay"]
-                        if tr.base.rstrip("/") != url.rstrip("/") or not relay_ok:
-                            tr = HttpTransport(url, cfg["token"])
-                            log("sandbox relay: %s" % url)
-                            relay_ok = True
-                    except BridgeError as exc:
-                        if relay_ok:
-                            log("lost the sandbox: %s" % exc)
-                        relay_ok = False
-                        time.sleep(5)   # do not hammer the beacon API
-
-            # ---- pull work -------------------------------------------------
-            batch = []
-            if relay_ok:
-                try:
-                    batch = tr.pull()
-                except BridgeError as exc:
-                    relay_ok = False
-                    say("sandbox relay is asleep - waiting for a message in Arena "
-                        "(this is normal between messages)")
-                    time.sleep(4)
-                    continue
-
-            if not batch:
-                if relay_ok and time.time() - last_beat > 30:
-                    last_beat = time.time()
-                    tr.beat("ready" if mcp_ready else "no-studio")
-                time.sleep(0.2)
+            try:
+                items = tr.list(TO_STUDIO)
+            except BridgeError as exc:
+                say("GitHub problem: %s" % exc)
+                time.sleep(10)
                 continue
+            last_note[0] = ""
 
-            for req in batch:
-                rid = req.get("id")
-                name = req.get("_name")
-                if rid in answered:
-                    tr.ack(rid, name)
+            for item in items:
+                name = item["name"]
+                try:
+                    req = tr.read(TO_STUDIO, name)
+                except BridgeError as exc:
+                    log("could not read %s: %s" % (name, exc))
                     continue
+
+                rid = req.get("id", name[:-5])
+                if rid in answered:
+                    tr.delete(TO_STUDIO, name, item.get("sha"))
+                    continue
+
                 label = (req.get("params") or {}).get("name") or req.get("method")
                 log(">> %s" % label)
                 reply = handle_request(mcp, req)
                 reply["id"] = rid
                 reply["ts"] = now()
-                try:
-                    tr.reply(rid, reply)   # answer first...
-                    tr.ack(rid, name)       # ...then forget the request
-                except BridgeError as exc:
-                    log("could not deliver the answer: %s" % exc)
-                    relay_ok = False
-                    break
+
+                # Answer first, then forget the request: a crash can never lose
+                # a result Studio already produced.
+                tr.write(TO_SANDBOX, name, reply)
+                tr.delete(TO_STUDIO, name, item.get("sha"))
                 answered.add(rid)
                 if len(answered) > 4000:
                     answered = set(list(answered)[-2000:])
                 log("<< %s %s" % (label, "ok" if reply.get("ok") else "ERROR"))
+
+            if not items:
+                if time.time() - last_heartbeat > 60:
+                    last_heartbeat = time.time()
+                    write_status(tr, "ready" if mcp_ready else "no-studio")
+                time.sleep(args.poll)
     except KeyboardInterrupt:
         log("stopped (Ctrl+C)")
     except BridgeError as exc:
@@ -684,30 +778,28 @@ def cmd_run(args):
         return 1
     finally:
         try:
+            write_status(tr, "offline")
+        except Exception:
+            pass
+        try:
             mcp.stop()
         except Exception:
             pass
+        tr.close()
     return 0
-
-
-DEFAULT_BEACON = (
-    "https://api.github.com/repos/sdlksdsf/Iloveroblox/contents/_relay/session.json"
-    "?ref=arena/79418886-iloveroblox"
-)
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Relay Roblox Studio's MCP server to the AI sandbox.")
+        description="Relay Roblox Studio's MCP server through your private GitHub repo.")
     p.add_argument("--setup", action="store_true", help="one-time setup: create a token")
-    p.add_argument("--show-token", action="store_true", help="print the saved token")
     p.add_argument("--doctor", action="store_true", help="check everything, list tools")
+    p.add_argument("--show-token", action="store_true", help="print the saved token")
     p.add_argument("--run", action="store_true", help="start relaying (default)")
     p.add_argument("--config", default=CONFIG_PATH)
     p.add_argument("--transport", help="dir:<folder> (offline self-test only)")
     p.add_argument("--mcp-bat", dest="mcp_cmd", help="path to mcp.bat if not default")
-    p.add_argument("--beacon", help="override the beacon URL")
-    p.add_argument("--relay-url", dest="relay_url", help="skip the beacon, use this relay")
+    p.add_argument("--poll", type=float, default=0.6, help="seconds between GitHub checks")
     args = p.parse_args(argv)
 
     if args.mcp_cmd:
@@ -716,10 +808,10 @@ def main(argv=None):
     try:
         if args.setup:
             return cmd_setup(args)
-        if args.show_token:
-            return cmd_show_token(args)
         if args.doctor:
             return cmd_doctor(args)
+        if args.show_token:
+            return cmd_show_token(args)
         return cmd_run(args)
     except BridgeError as exc:
         print("\nERROR: %s\n" % exc, file=sys.stderr)

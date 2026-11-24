@@ -3,8 +3,8 @@
 """
 Client side - runs inside the AI sandbox.
 
-Sends one JSON-RPC request to the relay and prints the answer. Used by the
-agent through the shell:
+Writes one request into the relay repo, waits for the bridge on your PC to
+answer, and prints the result.
 
     python3 client.py tools
     python3 client.py status
@@ -12,7 +12,7 @@ agent through the shell:
     python3 client.py call screen_capture --save shot.png
 
 Config comes from relay.json next to this file:
-    {"url": "http://127.0.0.1:8787", "token": "rlx_..."}
+    {"owner": "you", "repo": "roblox-studio-bridge", "branch": "main", "token": "ghp_..."}
 """
 from __future__ import annotations
 
@@ -24,93 +24,79 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bridge import (  # noqa: E402
+    BridgeError, DirTransport, GitHubTransport, TO_SANDBOX, TO_STUDIO,
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, ".cache")
 TOOLS_CACHE = os.path.join(CACHE, "tools.json")
 SHOTS = os.path.join(CACHE, "shots")
 
 
-class BridgeError(Exception):
-    pass
-
-
 # --------------------------------------------------------------------------
 # transports
 # --------------------------------------------------------------------------
-class HttpCall:
-    kind = "http"
+class RepoCall:
+    """Queue over the private GitHub repo (the real transport)."""
 
-    def __init__(self, url, token):
-        self.url = url.rstrip("/")
-        self.token = token
+    kind = "github"
 
-    def _post(self, path, body, timeout):
-        import urllib.error
-        import urllib.request
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(self.url + path, data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + self.token)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            raise BridgeError("relay said %s: %s" % (exc.code, exc.read()[:200]))
-        except Exception as exc:
-            raise BridgeError("cannot reach the relay at %s (%r)" % (self.url, exc))
-
-    def _get(self, path, timeout=15):
-        import urllib.error
-        import urllib.request
-        req = urllib.request.Request(self.url + path)
-        req.add_header("Authorization", "Bearer " + self.token)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read() or b"{}")
-        except urllib.error.HTTPError as exc:
-            raise BridgeError("relay said %s: %s" % (exc.code, exc.read()[:200]))
-        except Exception as exc:
-            raise BridgeError("cannot reach the relay at %s (%r)" % (self.url, exc))
+    def __init__(self, cfg):
+        self.tr = GitHubTransport(cfg["owner"], cfg["repo"], cfg["token"],
+                                  cfg.get("branch", "main"))
 
     def send(self, method, params, timeout):
-        reply = self._post("/call", {"method": method, "params": params, "timeout": timeout},
-                           timeout=timeout + 35)
-        if not reply.get("ok"):
-            err = reply.get("error") or {}
-            raise BridgeError(err.get("message") or "bridge returned an error")
-        return reply.get("result")
+        rid = uuid.uuid4().hex[:16]
+        name = rid + ".json"
+        self.tr.write(TO_STUDIO, name, {
+            "id": rid, "method": method, "params": params or {}, "timeout": timeout,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        deadline = time.time() + timeout + 25
+        while time.time() < deadline:
+            reply = self.tr.read_optional(TO_SANDBOX, name)
+            if reply is not None:
+                self.tr.delete(TO_SANDBOX, name)
+                if not reply.get("ok"):
+                    err = reply.get("error") or {}
+                    raise BridgeError(err.get("message") or "bridge returned an error")
+                return reply.get("result")
+            time.sleep(0.35)
+        raise BridgeError(
+            "No answer from the bridge after %ss.\n"
+            "Is START_BRIDGE.bat open in a window on the PC running Studio?"
+            % int(timeout + 25))
 
     def status(self):
-        return self._get("/status", timeout=10)
+        try:
+            return self.tr.read("_queue", "status.json")
+        except BridgeError:
+            return {}
 
 
 class DirCall:
     """Same wire protocol, but through a folder. Offline self-test only."""
+
     kind = "dir"
 
     def __init__(self, root):
-        self.root = os.path.abspath(root)
-        os.makedirs(os.path.join(self.root, "to-studio"), exist_ok=True)
-        os.makedirs(os.path.join(self.root, "to-sandbox"), exist_ok=True)
+        self.tr = DirTransport(root)
 
     def send(self, method, params, timeout):
         rid = uuid.uuid4().hex[:16]
-        with open(os.path.join(self.root, "to-studio", rid + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"id": rid, "method": method, "params": params or {},
-                       "timeout": timeout}, fh)
+        name = rid + ".json"
+        self.tr.write(TO_STUDIO, name, {
+            "id": rid, "method": method, "params": params or {}, "timeout": timeout,
+        })
         deadline = time.time() + timeout + 25
-        target = os.path.join(self.root, "to-sandbox", rid + ".json")
         while time.time() < deadline:
-            if os.path.exists(target):
-                time.sleep(0.05)
-                with open(target, encoding="utf-8") as fh:
-                    reply = json.load(fh)
-                try:
-                    os.remove(target)
-                    os.remove(os.path.join(self.root, "to-studio", rid + ".json"))
-                except OSError:
-                    pass
+            for item in self.tr.list(TO_SANDBOX):
+                if item["name"] != name:
+                    continue
+                reply = self.tr.read(TO_SANDBOX, name)
+                self.tr.delete(TO_SANDBOX, name, item.get("sha"))
                 if not reply.get("ok"):
                     err = reply.get("error") or {}
                     raise BridgeError(err.get("message") or "bridge error")
@@ -119,10 +105,10 @@ class DirCall:
         raise BridgeError("no answer from the bridge within %ss" % int(timeout + 25))
 
     def status(self):
-        path = os.path.join(self.root, "status.json")
-        if os.path.exists(path):
-            return json.load(open(path, encoding="utf-8"))
-        return {}
+        try:
+            return self.tr.read("_queue", "status.json")
+        except BridgeError:
+            return {}
 
 
 def load_config(path=None):
@@ -130,11 +116,7 @@ def load_config(path=None):
         if c and os.path.exists(c):
             with open(c, "r", encoding="utf-8") as fh:
                 return json.load(fh)
-    url = os.environ.get("RELAY_URL")
-    token = os.environ.get("RELAY_TOKEN")
-    if url and token:
-        return {"url": url, "token": token}
-    raise BridgeError("No relay.json next to client.py, and RELAY_URL/RELAY_TOKEN unset.")
+    return {}
 
 
 def make_transport(cfg, override=None):
@@ -142,9 +124,10 @@ def make_transport(cfg, override=None):
         if override.startswith("dir:"):
             return DirCall(override[4:])
         raise BridgeError("Only dir:<folder> is supported for --transport.")
-    if not cfg.get("url") or not cfg.get("token"):
-        raise BridgeError("relay.json needs 'url' and 'token'.")
-    return HttpCall(cfg["url"], cfg["token"])
+    for key in ("owner", "repo", "token"):
+        if not cfg.get(key):
+            raise BridgeError("relay.json is missing '%s'." % key)
+    return RepoCall(cfg)
 
 
 # --------------------------------------------------------------------------
@@ -273,10 +256,7 @@ def main(argv=None):
             return 0
 
         if args.command == "status":
-            try:
-                print(json.dumps(tr.status(), indent=1))
-            except Exception as exc:
-                print("status unavailable: %s" % exc)
+            print(json.dumps(tr.status(), indent=1))
             try:
                 pong = tr.send("ping", {}, 8)
                 print("BRIDGE ONLINE  %s" % json.dumps(pong))
