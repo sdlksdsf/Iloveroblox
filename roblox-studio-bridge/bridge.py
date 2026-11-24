@@ -158,6 +158,9 @@ class HttpTransport:
     def health(self):
         return self._req("GET", "/health", timeout=10)
 
+    def status(self):
+        return self._req("GET", "/status", timeout=10)
+
     def pull(self):
         return self._req("GET", "/next?wait=20", timeout=32).get("requests", [])
 
@@ -474,9 +477,12 @@ def cmd_doctor(args):
 
     if args.transport:
         tr = build_transport(cfg, args)
+    elif args.relay_url:
+        print("Relay       : %s (fixed URL)" % args.relay_url)
+        tr = HttpTransport(args.relay_url, cfg["token"])
     else:
         try:
-            beacon = fetch_beacon(cfg["beacon_url"])
+            beacon = fetch_beacon(cfg.get("beacon_url") or DEFAULT_BEACON)
             print("Beacon      : %s" % beacon.get("relay"))
         except BridgeError as exc:
             print("Beacon      : unreachable -> %s" % exc)
@@ -486,10 +492,21 @@ def cmd_doctor(args):
         tr = HttpTransport(beacon["relay"], cfg["token"])
 
     try:
-        print("Relay       : up (%s)" % tr.health().get("uptime"))
+        print("Relay       : up (%ss)" % tr.health().get("uptime"))
     except BridgeError as exc:
         print("Relay       : DOWN -> %s" % exc)
         return 1
+
+    if isinstance(tr, HttpTransport):
+        try:
+            tr.status()
+            print("Auth        : OK - the sandbox accepts this PC's token")
+        except BridgeError as exc:
+            print("Auth        : REJECTED -> %s" % exc)
+            print("\nThe sandbox is running but has not been given this PC's token.")
+            print("Paste the token printed by SETUP.bat into the Arena chat, then")
+            print("run --doctor again.\n")
+            return 1
 
     mcp = McpProcess(cmd)
     try:
