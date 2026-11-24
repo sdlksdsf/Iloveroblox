@@ -1,1 +1,0 @@
-{"id": "4107e79d2e754bbb", "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "latency", "studio_id": "studio-MOCK01"}}, "timeout": 180, "ts": "2026-11-24T14:26:47Z"}
