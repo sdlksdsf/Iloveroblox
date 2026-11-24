@@ -55,8 +55,17 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 
+LOG_FILE = os.path.join(HERE, "bridge.log")
+
+
 def log(msg):
-    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+    line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 def now():
@@ -475,51 +484,17 @@ def cmd_doctor(args):
         print("Token       : not ready -> %s" % exc)
         return 1
 
-    if args.transport:
-        tr = build_transport(cfg, args)
-    elif args.relay_url:
-        print("Relay       : %s (fixed URL)" % args.relay_url)
-        tr = HttpTransport(args.relay_url, cfg["token"])
-    else:
-        try:
-            beacon = fetch_beacon(cfg.get("beacon_url") or DEFAULT_BEACON)
-            print("Beacon      : %s" % beacon.get("relay"))
-        except BridgeError as exc:
-            print("Beacon      : unreachable -> %s" % exc)
-            print("              (that is normal if the sandbox is not running)")
-            return 1
-        cfg["relay_url"] = beacon["relay"]
-        tr = HttpTransport(beacon["relay"], cfg["token"])
-
-    try:
-        print("Relay       : up (%ss)" % tr.health().get("uptime"))
-    except BridgeError as exc:
-        print("Relay       : DOWN -> %s" % exc)
-        return 1
-
-    if isinstance(tr, HttpTransport):
-        try:
-            tr.status()
-            print("Auth        : OK - the sandbox accepts this PC's token")
-        except BridgeError as exc:
-            print("Auth        : REJECTED -> %s" % exc)
-            print("\nThe sandbox is running but has not been given this PC's token.")
-            print("Paste the token printed by SETUP.bat into the Arena chat, then")
-            print("run --doctor again.\n")
-            return 1
-
+    # ---- local half: Roblox Studio itself (works while the sandbox sleeps)
     mcp = McpProcess(cmd)
+    names = []
     try:
         mcp.start()
         info = mcp.initialize()
-        print("MCP         : handshake OK (%s)" % (info.get("serverInfo") or "unknown"))
         names = mcp.tool_names()
+        print("MCP         : handshake OK (%s)" % (info.get("serverInfo") or "unknown"))
         print("Tools       : %d" % len(names))
         if names:
             print("              " + ", ".join(names[:8]) + ("..." if len(names) > 8 else ""))
-        tr.beat("ready", {"tools": len(names)})
-        print("\nAll good. Double-click START_BRIDGE.bat to begin.\n")
-        return 0
     except BridgeError as exc:
         print("\nFAILED -> %s\n" % exc)
         print("Checklist:\n"
@@ -530,6 +505,65 @@ def cmd_doctor(args):
         return 1
     finally:
         mcp.stop()
+
+    # ---- remote half: the sandbox relay --------------------------------
+    if args.transport:
+        tr = build_transport(cfg, args)
+    elif args.relay_url:
+        tr = HttpTransport(args.relay_url, cfg["token"])
+    else:
+        try:
+            beacon = fetch_beacon(cfg.get("beacon_url") or DEFAULT_BEACON)
+            print("Beacon      : %s" % beacon.get("relay"))
+            tr = HttpTransport(beacon["relay"], cfg["token"])
+        except BridgeError as exc:
+            print("Beacon      : unreachable -> %s" % exc)
+            return 1
+
+    print("Relay       : waiting up to 30s for the sandbox ", end="", flush=True)
+    up = False
+    for _ in range(10):
+        try:
+            tr.health()
+            up = True
+            break
+        except BridgeError:
+            print(".", end="", flush=True)
+            time.sleep(3)
+    print()
+
+    if not up:
+        print("Relay       : ASLEEP  (this is normal, not a fault)")
+        print()
+        print("  The sandbox only runs while the agent is working on a message.")
+        print("  To connect:")
+        print("    1. Double-click START_BRIDGE.bat and leave the window open.")
+        print("    2. Send any message in Arena.")
+        print("    3. The bridge connects within seconds and starts working.")
+        print()
+        return 0
+
+    try:
+        tr.status()
+        print("Auth        : OK - the sandbox accepts this PC's token")
+    except BridgeError as exc:
+        print("Auth        : REJECTED -> %s" % exc)
+        print("\nThe sandbox is up but has not been given this PC's token.")
+        print("Paste the full token printed by SETUP.bat into the Arena chat.\n")
+        return 1
+
+    tr.beat("ready", {"tools": len(names)})
+    print("\nAll good. Double-click START_BRIDGE.bat to begin.\n")
+    return 0
+
+
+def cmd_show_token(args):
+    cfg = load_config(args.config)
+    print("\nYour bridge token:\n")
+    print("    " + cfg["token"] + "\n")
+    print("Paste that whole line into the Arena chat. It is already saved in")
+    print("bridge.config.json - you do not need to type it again.\n")
+    return 0
 
 
 def cmd_run(args):
@@ -554,6 +588,13 @@ def cmd_run(args):
 
     mcp = McpProcess(cmd)
     answered = set()
+    last_note = [""]
+
+    def say(msg):
+        if msg != last_note[0]:
+            log(msg)
+            last_note[0] = msg
+
     mcp_ready = False
     last_beacon = 0.0
     last_beat = 0.0
@@ -601,9 +642,10 @@ def cmd_run(args):
                 try:
                     batch = tr.pull()
                 except BridgeError as exc:
-                    log("relay problem: %s" % exc)
                     relay_ok = False
-                    time.sleep(2)
+                    say("sandbox relay is asleep - waiting for a message in Arena "
+                        "(this is normal between messages)")
+                    time.sleep(4)
                     continue
 
             if not batch:
@@ -658,6 +700,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         description="Relay Roblox Studio's MCP server to the AI sandbox.")
     p.add_argument("--setup", action="store_true", help="one-time setup: create a token")
+    p.add_argument("--show-token", action="store_true", help="print the saved token")
     p.add_argument("--doctor", action="store_true", help="check everything, list tools")
     p.add_argument("--run", action="store_true", help="start relaying (default)")
     p.add_argument("--config", default=CONFIG_PATH)
@@ -673,6 +716,8 @@ def main(argv=None):
     try:
         if args.setup:
             return cmd_setup(args)
+        if args.show_token:
+            return cmd_show_token(args)
         if args.doctor:
             return cmd_doctor(args)
         return cmd_run(args)
