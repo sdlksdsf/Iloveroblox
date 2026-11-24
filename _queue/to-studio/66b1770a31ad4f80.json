@@ -1,0 +1,1 @@
+{"id": "66b1770a31ad4f80", "method": "tools/call", "params": {"name": "screen_capture", "arguments": {"studio_id": "studio-MOCK01"}}, "timeout": 180, "ts": "2026-11-24T14:22:47Z"}
