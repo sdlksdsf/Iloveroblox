@@ -1,0 +1,1 @@
+{"id": "67f91d1031a9480c", "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "github", "studio_id": "studio-MOCK01"}}, "timeout": 180, "ts": "2026-11-24T14:22:28Z"}
